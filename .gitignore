@@ -31,5 +31,5 @@ go.work.sum
 .idea/
 .vscode/
 .zed/
-# Vim swap files
-[._]*.s[a-v][a-z]
+*.swo
+*.swp
