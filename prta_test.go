@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/tools/go/callgraph"
 	ogrta "golang.org/x/tools/go/callgraph/rta"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
 )
@@ -65,7 +66,8 @@ func compareCallGraphs(t *testing.T, og, pg *callgraph.Graph) {
 }
 
 func TestPrta(t *testing.T) {
-	ssaProg := nil
+	var ssaProg *ssa.Program
+	var allPkgs []*packages.Package
 
 	entry := []*ssa.Function{}
 	for f, ok := range ssautil.AllFunctions(ssaProg) {
