@@ -1,10 +1,9 @@
+package utils
+
 // Concurrent typeutils.Map
 //
 // Most of the code is borrowed, but the core map data structure used is a
 // sync.Map
-//
-// TODO(elton): fine-grained locks over entry
-package prta
 
 import (
 	"bytes"
@@ -32,7 +31,7 @@ import (
 // a types.Hash function are accepted.
 type TypeMap struct {
 	table  sync.Map
-	length int64 // number of map entries
+	length atomic.Int64 // number of map entries
 }
 
 var theHasher typeutil.Hasher
@@ -74,7 +73,7 @@ func (m *TypeMap) Delete(key types.Type) bool {
 					// We can't compact the bucket as it
 					// would disturb iterators.
 					bucket.entries[i] = entry{}
-					atomic.AddInt64(&m.length, -1)
+					m.length.Add(-1)
 					return true
 				}
 			}
@@ -131,11 +130,45 @@ func (m *TypeMap) Set(key types.Type, value any) (prev any) {
 		m.table.Store(hash, b)
 	}
 
-	atomic.AddInt64(&m.length, 1)
+	m.length.Add(1)
 
 	return
 }
 
+// SetNoLock performs Set, but without acquiring the writer lock
+func (m *TypeMap) SetNoLock(key types.Type, value any) (prev any) {
+	hash := hash(key)
+	val, ok := m.table.Load(hash)
+
+	b := &bucket{}
+	if ok {
+		b = val.(*bucket)
+	}
+
+	var hole *entry
+	for i, e := range b.entries {
+		if e.key == nil {
+			hole = &b.entries[i]
+		} else if types.Identical(key, e.key) {
+			prev = e.value
+			b.entries[i].value = value
+			return
+		}
+	}
+
+	if hole != nil {
+		*hole = entry{key, value} // overwrite deleted entry
+	} else {
+		b.entries = append(b.entries, entry{key, value})
+		m.table.Store(hash, b)
+	}
+
+	m.length.Add(1)
+
+	return
+}
+
+// LoadOrStore performs an atomic load-or-store operation over a type map
 func (m *TypeMap) LoadOrStore(key types.Type, value any) (any, bool) {
 	if val, loaded := m.table.LoadOrStore(hash(key), &bucket{entries: []entry{{key, value}}}); loaded {
 		bucket := val.(*bucket)
@@ -162,20 +195,33 @@ func (m *TypeMap) LoadOrStore(key types.Type, value any) (any, bool) {
 		}
 
 		// Add the new entry
-		bucket.entries = append(bucket.entries, entry{key, value})
-		atomic.AddInt64(&m.length, 1)
+		var hole *entry
+		for i, e := range bucket.entries {
+			if e.key == nil {
+				hole = &bucket.entries[i]
+			} else if types.Identical(key, e.key) {
+				bucket.entries[i].value = value
+			}
+		}
+		if hole != nil {
+			*hole = entry{key, value} // overwrite deleted entry
+		} else {
+			bucket.entries = append(bucket.entries, entry{key, value})
+		}
+
+		m.length.Add(1)
 		return value, false
 	}
 
 	// New bucket was created
-	atomic.AddInt64(&m.length, 1)
+	m.length.Add(1)
 	return value, false
 }
 
 // Len returns the number of map entries.
 func (m *TypeMap) Len() int {
 	if m != nil {
-		return int(atomic.LoadInt64(&m.length))
+		return int(m.length.Load())
 	}
 	return 0
 }
@@ -191,9 +237,11 @@ func (m *TypeMap) Iterate(f func(key types.Type, value any)) {
 	if m != nil {
 		m.table.Range(func(key any, value any) bool {
 			bucket := value.(*bucket)
-			bucket.lk.Lock()
-			defer bucket.lk.Unlock()
+			// bucket.lk.Lock()
+			bucket.lk.RLock()
+			defer bucket.lk.RUnlock()
 			for _, e := range bucket.entries {
+				// If the key is nil, then it is a hole. Holes are ignored.
 				if e.key != nil {
 					f(e.key, e.value)
 				}

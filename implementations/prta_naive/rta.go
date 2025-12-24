@@ -1,53 +1,102 @@
 // Parallel RTA
 //
-// Code is heavily borrowed from Go's RTA package. We make some changes to make
+// Code is heavily borrowed from Go's RTA package. We have modified it make
 // it parallel.
 
-package prta
+package prta_naive
 
 import (
 	"fmt"
-	// "strings"
 	"go/types"
 	"hash/crc32"
-	"hash/fnv"
-	"sort"
+	"runtime"
 	"sync"
+	"unsafe"
 
+	"github.com/1ntEgr8/kumo"
+	"github.com/1ntEgr8/kumo/lockfree"
+	"github.com/1ntEgr8/kumo/utils"
 	"golang.org/x/tools/go/callgraph"
-	"golang.org/x/tools/go/packages"
+	rtapkg "golang.org/x/tools/go/callgraph/rta"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/types/typeutil"
-
-	"github.com/1ntEgr8/prta/lockfree"
 )
 
-// A Result holds the results of Rapid Type Analysis, which includes the
-// set of reachable functions/methods, runtime types, and the call graph.
+// Result implements the kumo.Result interface for parallel RTA.
+// It uses sync.Map internally for concurrent access during analysis.
 type Result struct {
-	// CallGraph is the discovered callgraph.
-	// It does not include edges for calls made via reflection.
-	CallGraph *callgraph.Graph
+	callGraph    *callgraph.Graph
+	reachable    sync.Map // map[*ssa.Function]bool (AddrTaken)
+	runtimeTypes utils.TypeMap
+}
 
-	// Reachable contains the set of reachable functions and methods.
-	// This includes exported methods of runtime types, since
-	// they may be accessed via reflection.
-	// The value indicates whether the function is address-taken.
-	//
-	// (We wrap the bool in a struct to avoid inadvertent use of
-	// "if Reachable[f] {" to test for set membership.)
-	Reachable sync.Map // map[*ssa.Function]struct{ AddrTaken bool }
+// GetCallGraph returns the discovered callgraph.
+func (r *Result) GetCallGraph() *callgraph.Graph {
+	return r.callGraph
+}
 
-	// RuntimeTypes contains the set of types that are needed at
-	// runtime, for interfaces or reflection.
-	//
-	// The value indicates whether the type is inaccessible to reflection.
-	// Consider:
-	// 	type A struct{B}
-	// 	fmt.Println(new(A))
-	// Types *A, A and B are accessible to reflection, but the unnamed
-	// type struct{B} is not.
-	RuntimeTypes TypeMap
+// GetReachable returns the set of reachable functions.
+// This converts from the internal sync.Map to a regular map.
+func (r *Result) GetReachable() map[*ssa.Function]struct{ AddrTaken bool } {
+	reachableMap := make(map[*ssa.Function]struct{ AddrTaken bool })
+	r.reachable.Range(func(key, value any) bool {
+		reachableMap[key.(*ssa.Function)] = struct{ AddrTaken bool }{AddrTaken: value.(bool)}
+		return true
+	})
+	return reachableMap
+}
+
+// GetRuntimeTypes returns the set of runtime types.
+func (r *Result) GetRuntimeTypes() typeutil.Map {
+	// Convert utils.TypeMap to typeutil.Map
+	var tm typeutil.Map
+	tm.SetHasher(typeutil.MakeHasher())
+	r.runtimeTypes.Iterate(func(key types.Type, value any) {
+		tm.Set(key, value)
+	})
+	return tm
+}
+
+// Materialize converts the result to the standard rta.Result.
+// For parallel implementation, this performs the conversion from sync.Map to regular map.
+func (r *Result) Materialize() *rtapkg.Result {
+	return &rtapkg.Result{
+		CallGraph:    r.GetCallGraph(),
+		Reachable:    r.GetReachable(),
+		RuntimeTypes: r.GetRuntimeTypes(),
+	}
+}
+
+const _dedupEdgesSmallThreshold = 10
+
+type workItem interface {
+	doWork(r *rta)
+}
+
+type processFunctionWorkItem struct {
+	fn *ssa.Function
+}
+
+func (w *processFunctionWorkItem) doWork(r *rta) {
+	r.visitFunc(w.fn)
+}
+
+type deduplicateEdgesWorkItem struct {
+	nodes     []*callgraph.Node
+	semaphore chan []*callgraph.Node
+}
+
+func (w *deduplicateEdgesWorkItem) doWork(r *rta) {
+	for _, node := range w.nodes {
+		if len(node.In) > 1 {
+			node.In = dedupEdges(node.In)
+		}
+		if len(node.Out) > 1 {
+			node.Out = dedupEdges(node.Out)
+		}
+	}
+	// Return slice to semaphore for recycling
+	w.semaphore <- w.nodes[:0]
 }
 
 // Working state of the RTA algorithm.
@@ -58,22 +107,22 @@ type rta struct {
 
 	reflectValueCall *ssa.Function // (*reflect.Value).Call, iff part of prog
 
-	work     *lockfree.MSQueue[*ssa.Function]
+	work     *lockfree.MSQueue[workItem]
 	workDone chan struct{}
 	workWg   sync.WaitGroup
 
 	// addrTakenFuncsBySig contains all address-taken *Functions, grouped by signature.
 	// Keys are *types.Signature, values are map[*ssa.Function]bool sets.
-	addrTakenFuncsBySig TypeMap
+	addrTakenFuncsBySig utils.TypeMap
 
 	// dynCallSites contains all dynamic "call"-mode call sites, grouped by signature.
-	// Keys are *types.Signature, values are unordered []ssa.CallInstruction.
-	dynCallSites TypeMap
+	// Keys are *types.Signature, values are unordered ssa.CallInstruction sets (represented using sync.Map).
+	dynCallSites utils.TypeMap
 
 	// invokeSites contains all "invoke"-mode call sites, grouped by interface.
 	// Keys are *types.Interface (never *types.Named),
-	// Values are unordered []ssa.CallInstruction sets.
-	invokeSites TypeMap
+	// Values are unordered ssa.CallInstruction sets (represented using sync.Map).
+	invokeSites utils.TypeMap
 
 	// The following two maps together define the subset of the
 	// m:n "implements" relation needed by the algorithm.
@@ -81,67 +130,64 @@ type rta struct {
 	// concreteTypes maps each concrete type to information about it.
 	// Keys are types.Type, values are *concreteTypeInfo.
 	// Only concrete types used as MakeInterface operands are included.
-	concreteTypes TypeMap
+	concreteTypes utils.TypeMap
 
 	// interfaceTypes maps each interface type to information about it.
 	// Keys are *types.Interface, values are *interfaceTypeInfo.
 	// Only interfaces used in "invoke"-mode CallInstructions are included.
-	interfaceTypes TypeMap
+	interfaceTypes utils.TypeMap
 
 	callgraphLk sync.Mutex
-
-	aliasLk sync.Mutex
-
-	// Current step count for debugging
-	currentStep int
-
-	concreteTypeInfoTbl  map[types.Type]*concreteTypeInfo
-	interfaceTypeInfoTbl map[*types.Interface]*interfaceTypeInfo
 }
 
 type concreteTypeInfo struct {
-	C          types.Type
-	mset       *types.MethodSet
-	fprint     uint64             // fingerprint of method set
-	implements []*types.Interface // unordered set of implemented interfaces
+	C      types.Type
+	mset   *types.MethodSet
+	fprint uint64 // fingerprint of method set
 
-	initialized bool
-	mu          sync.Mutex // protects implements slice
+	implements utils.TypeMap
+
+	// We use a channel to signal when initialization is done because `concreteTypeInfo` is made visible in the `concreteTypes` map before we populate the `implements` field. This allows consumers that only wish to know the presence of the `concreteTypeInfo` to progress, while those that need to access `implements` must block on the `initDone` channel.
+	initDone chan struct{} // closed when initialization is complete
 }
 
 type interfaceTypeInfo struct {
-	I               *types.Interface
-	mset            *types.MethodSet
-	fprint          uint64
-	implementations []types.Type // unordered set of concrete implementations
+	I      *types.Interface
+	mset   *types.MethodSet
+	fprint uint64
 
-	initialized bool
-	mu          sync.Mutex // protects implementations slice
+	implementations utils.TypeMap
+
+	// See comment in `concreteTypeInfo`
+	initDone chan struct{} // closed when initialization is complete
 }
 
-// TODO (could be replaced with a sync.Map)
 type callSites struct {
-	sites []ssa.CallInstruction
-	lk    sync.Mutex
+	sites sync.Map
 }
 
 // addReachable marks a function as potentially callable at run-time,
 // and ensures that it gets processed.
 func (r *rta) addReachable(f *ssa.Function, addrTaken bool) {
-	existing, loaded := r.result.Reachable.LoadOrStore(f, struct{ AddrTaken bool }{addrTaken})
-	if loaded && addrTaken && !existing.(struct{ AddrTaken bool }).AddrTaken {
-		// Need to update existing entry to set AddrTaken=true
-		r.result.Reachable.Store(f, struct{ AddrTaken bool }{true})
+	existing, loaded := r.result.reachable.LoadOrStore(f, addrTaken)
+	if loaded && addrTaken && !existing.(bool) {
+		// Need to update existing entry to set addr taken to true
+		r.result.reachable.Store(f, true)
 	}
 	if !loaded {
 		// First time seeing f.  Add it to the worklist.
-		r.addToWorklist(f)
+		r.addFunctionToWorklist(f)
 	}
 }
 
-func (r *rta) addToWorklist(f *ssa.Function) {
+func (r *rta) addToWorklist(item workItem) {
+	// In the current implementation, new work items are only added while processing an existing work item. The worker calls workWg.Add(1) for each new work item it adds and only then does it call workWg.Done(), after it has done processing _it's own work item_. This ensures that the main thread does not exit from the wait group while there is still work to do.
 	r.workWg.Add(1)
-	r.work.Enqueue(f)
+	r.work.Enqueue(item)
+}
+
+func (r *rta) addFunctionToWorklist(f *ssa.Function) {
+	r.addToWorklist(&processFunctionWorkItem{fn: f})
 }
 
 // addEdge adds the specified call graph edge, and marks it reachable.
@@ -150,13 +196,15 @@ func (r *rta) addToWorklist(f *ssa.Function) {
 func (r *rta) addEdge(caller *ssa.Function, site ssa.CallInstruction, callee *ssa.Function, addrTaken bool) {
 	r.addReachable(callee, addrTaken)
 
-	if g := r.result.CallGraph; g != nil {
+	if g := r.result.callGraph; g != nil {
 		if caller == nil {
 			panic(site)
 		}
 
+		// TODO(elton): Remove this lock after callgraph type is made thread-safe
 		r.callgraphLk.Lock()
 
+		// g.CreateNode takes care of node de-duplication
 		from := g.CreateNode(caller)
 		to := g.CreateNode(callee)
 		callgraph.AddEdge(from, site, to)
@@ -175,11 +223,6 @@ func (r *rta) visitAddrTakenFunc(f *ssa.Function) {
 	val, _ := r.addrTakenFuncsBySig.LoadOrStore(S, &sync.Map{})
 	funcs := val.(*sync.Map)
 
-	// if funcs == nil {
-	// 	funcs = make(map[*ssa.Function]bool)
-	// 	r.addrTakenFuncsBySig.Set(S, funcs)
-	// }
-
 	if _, loaded := funcs.LoadOrStore(f, true); !loaded {
 		// First time seeing f.
 
@@ -187,11 +230,11 @@ func (r *rta) visitAddrTakenFunc(f *ssa.Function) {
 		// and add call graph edges.
 		val, _ := r.dynCallSites.LoadOrStore(S, &callSites{})
 		s := val.(*callSites)
-		s.lk.Lock()
-		for _, site := range s.sites {
+		s.sites.Range(func(key any, value any) bool {
+			site := key.(ssa.CallInstruction)
 			r.addEdge(site.Parent(), site, f, true)
-		}
-		s.lk.Unlock()
+			return true
+		})
 
 		// If the program includes (*reflect.Value).Call,
 		// add a dynamic call edge from it to any address-taken
@@ -227,11 +270,10 @@ func (r *rta) visitDynCall(site ssa.CallInstruction) {
 	S := site.Common().Signature()
 
 	// Record the call site.
+	// Note: A function is never added more than once to the worklist. A callsite is added only by visiting each instruction in the function. So, it can also be added to s.sites only once.
 	val, _ := r.dynCallSites.LoadOrStore(S, &callSites{})
 	s := val.(*callSites)
-	s.lk.Lock()
-	s.sites = append(s.sites, site)
-	s.lk.Unlock()
+	s.sites.Store(site, struct{}{})
 
 	// For each function of signature S that we know is address-taken,
 	// add an edge and mark it reachable.
@@ -262,18 +304,18 @@ func (r *rta) visitInvoke(site ssa.CallInstruction) {
 	val, _ := r.invokeSites.LoadOrStore(I, &callSites{})
 	s := val.(*callSites)
 
-	s.lk.Lock()
-	s.sites = append(s.sites, site)
-	s.lk.Unlock()
-
-	// r.invokeSites.Set(I, append(sites, site))
+	s.sites.Store(site, struct{}{})
 
 	// Add callgraph edge for each existing
 	// address-taken concrete type implementing I.
 	iinfo := r.implementations(I)
-	for _, C := range iinfo.implementations {
+
+	// Wait for initialization to complete
+	<-iinfo.initDone
+
+	iinfo.implementations.Iterate(func(C types.Type, v any) {
 		r.addInvokeEdge(site, C)
-	}
+	})
 }
 
 // ---------- main algorithm ----------
@@ -320,43 +362,12 @@ func (r *rta) visitFunc(f *ssa.Function) {
 	}
 }
 
-func (r *rta) populateTable(pkgs []*packages.Package) {
-	concreteTypeInfoTbl := make(map[types.Type]*concreteTypeInfo)
-	interfaceTypeInfoTbl := make(map[*types.Interface]*interfaceTypeInfo)
+// RTA is an RTA implementation using a work-item based approach with deduplication.
+type RTA struct{}
 
-	fmt.Println("Populating table...")
-
-	for _, pkg := range pkgs {
-		fmt.Printf("Package %v\n", pkg)
-		for _, obj := range pkg.TypesInfo.Defs {
-			if obj == nil {
-				continue
-			}
-			ty := types.Unalias(obj.Type())
-			if types.IsInterface(ty) {
-				I := ty.Underlying().(*types.Interface)
-				mset := r.prog.MethodSets.MethodSet(I)
-				interfaceTypeInfoTbl[I] = &interfaceTypeInfo{
-					I:      I,
-					mset:   mset,
-					fprint: fingerprint(mset),
-				}
-			} else {
-				C := ty
-				mset := r.prog.MethodSets.MethodSet(C)
-				concreteTypeInfoTbl[C] = &concreteTypeInfo{
-					C:      C,
-					mset:   mset,
-					fprint: fingerprint(mset),
-				}
-			}
-		}
-	}
-
-	r.concreteTypeInfoTbl = concreteTypeInfoTbl
-	r.interfaceTypeInfoTbl = interfaceTypeInfoTbl
-
-	fmt.Println("DONE")
+// New creates a new RTA instance.
+func New() *RTA {
+	return &RTA{}
 }
 
 // Analyze performs Rapid Type Analysis, starting at the specified root
@@ -370,23 +381,25 @@ func (r *rta) populateTable(pkgs []*packages.Package) {
 // If buildCallGraph is true, Result.CallGraph will contain a call
 // graph; otherwise, only the other fields (reachable functions) are
 // populated.
-func Analyze(roots []*ssa.Function, pkgs []*packages.Package, buildCallGraph bool, numWorkers int) *Result {
+func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, numWorkers int) kumo.Result {
 	if len(roots) == 0 {
 		return nil
 	}
 
+	// Default to 1 worker
+	if numWorkers <= 0 {
+		numWorkers = 1
+	}
+
 	r := &rta{
-		result:   &Result{Reachable: sync.Map{}},
+		result:   &Result{},
 		prog:     roots[0].Prog,
-		work:     lockfree.NewMSQueue[*ssa.Function](),
+		work:     lockfree.NewMSQueue[workItem](),
 		workDone: make(chan struct{}),
 	}
 
 	if buildCallGraph {
-		// TODO(adonovan): change callgraph API to eliminate the
-		// notion of a distinguished root node.  Some callgraphs
-		// have many roots, or none.
-		r.result.CallGraph = callgraph.New(roots[0])
+		r.result.callGraph = callgraph.New(roots[0])
 	}
 
 	// Grab ssa.Function for (*reflect.Value).Call,
@@ -397,19 +410,17 @@ func Analyze(roots []*ssa.Function, pkgs []*packages.Package, buildCallGraph boo
 	}
 
 	hasher := typeutil.MakeHasher()
-	r.result.RuntimeTypes.SetHasher(hasher)
+	r.result.runtimeTypes.SetHasher(hasher)
 	r.addrTakenFuncsBySig.SetHasher(hasher)
 	r.dynCallSites.SetHasher(hasher)
 	r.invokeSites.SetHasher(hasher)
 	r.concreteTypes.SetHasher(hasher)
 	r.interfaceTypes.SetHasher(hasher)
 
-	// Pre-populate table
-	r.populateTable(pkgs)
-
 	// Start workers
 	for i := range numWorkers {
 		go func(i int) {
+			defaultCount := 0
 			for {
 				select {
 				case _, ok := <-r.workDone:
@@ -419,8 +430,22 @@ func Analyze(roots []*ssa.Function, pkgs []*packages.Package, buildCallGraph boo
 				default:
 					work, ok := r.work.Dequeue()
 					if ok {
-						r.visitFunc(work)
+						work.doWork(r)
 						r.workWg.Done()
+						defaultCount = 0
+					} else {
+						// The worker goroutines use a select statement with a default case that
+						// continuously calls Dequeue() when the queue is empty. This creates a tight
+						// loop that consumes CPU unnecessarily when no work is available, as the
+						// goroutine will repeatedly try to dequeue without any blocking or delay.
+						//
+						// To circumvent this, if we hit default repeatedly for 10 times, yield control
+						// back to the runtime
+						defaultCount++
+						if defaultCount >= 10 {
+							runtime.Gosched()
+							defaultCount = 0
+						}
 					}
 				}
 			}
@@ -432,58 +457,156 @@ func Analyze(roots []*ssa.Function, pkgs []*packages.Package, buildCallGraph boo
 		r.addReachable(root, false)
 	}
 
-	// Wait for all work to complete
+	// Wait for RTA-related work to complete
 	r.workWg.Wait()
+
+	// De-duplicate edges, using the worker pool with batching
+	r.processNodesInBatches(numWorkers)
 
 	// Signal workers to shut down
 	close(r.workDone)
 
+	// Copy sync.Map reference to result - no conversion needed until Materialize()
+
 	return r.result
 }
 
+// processNodesInBatches processes deduplication work items in batches to avoid
+// doubling memory usage by limiting the number of work items queued at once.
+// It uses a batch size of 2*numWorkers.
+// A buffered channel acts as both a semaphore and a slice pool.
+func (r *rta) processNodesInBatches(numWorkers int) {
+	batchSize := numWorkers * 2
+
+	// Create semaphore channel that holds slices for recycling
+	semaphore := make(chan []*callgraph.Node, batchSize)
+
+	// Pre-populate with empty slices
+	for i := 0; i < batchSize; i++ {
+		semaphore <- make([]*callgraph.Node, 0, batchSize)
+	}
+
+	// Get a slice from the semaphore (blocks if none available)
+	batch := <-semaphore
+
+	// Process nodes directly from the map without creating an intermediate slice
+	for _, node := range r.result.callGraph.Nodes {
+		batch = append(batch, node)
+
+		// When batch is full, submit it and get a new one
+		if len(batch) >= batchSize {
+			r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore})
+
+			// Get next slice from semaphore (blocks if all are in use)
+			batch = <-semaphore
+		}
+	}
+
+	// Submit remaining nodes if any
+	if len(batch) > 0 {
+		r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore})
+	} else {
+		// Return unused slice to semaphore
+		semaphore <- batch
+	}
+
+	// Wait for all batches to complete by draining the semaphore
+	for i := 0; i < batchSize; i++ {
+		<-semaphore
+	}
+}
+
+// interfaces() and implementations()
+//
+// In both of these methods, if we are encoutering the concrete type/interface
+// for the first time, we broadcast the existence of a
+// concreteTypeInfo/interfaceTypeInfo (via a LoadOrStore) and only then
+// populate `implements`/`implementations` fields (via Range). This order
+// ensures that no work item gets dropped; either a consumer of `interfaces()`
+// will end up adding it, or a consumer of `implementations()` will add it.
+
 // interfaces(C) returns all currently known interfaces implemented by C.
 func (r *rta) interfaces(C types.Type) *concreteTypeInfo {
-	cinfo, ok := r.concreteTypeInfoTbl[C]
-	if !ok {
-		panic(fmt.Sprintf("Concrete type not found in table %v", C))
-	}
-	for !cinfo.initialized {
-		cinfo.mu.Lock()
-		for I, iinfo := range r.interfaceTypeInfoTbl {
-			if implements(cinfo, iinfo) {
-				cinfo.implements = append(cinfo.implements, I)
-			}
+	switch C.(type) {
+	case *types.Tuple,
+		*types.Array,
+		*types.Slice,
+		*types.Chan,
+		*types.Signature,
+		*types.Map:
+		cinfo := &concreteTypeInfo{
+			C:        C,
+			initDone: make(chan struct{}),
 		}
-		cinfo.initialized = true
-		cinfo.mu.Unlock()
+		close(cinfo.initDone)
+		return cinfo
+	}
+
+	// Create an info for C the first time we see it.
+	var cinfo *concreteTypeInfo
+	if v := r.concreteTypes.At(C); v != nil {
+		cinfo = v.(*concreteTypeInfo)
+	} else {
+		mset := r.prog.MethodSets.MethodSet(C)
+		cinfo = &concreteTypeInfo{
+			C:        C,
+			mset:     mset,
+			fprint:   fingerprint(mset),
+			initDone: make(chan struct{}),
+		}
+		if oldcinfo, loaded := r.concreteTypes.LoadOrStore(C, cinfo); !loaded {
+			// Ascertain set of interfaces C implements
+			// and update the 'implements' relation.
+			r.interfaceTypes.Iterate(func(I types.Type, v any) {
+				iinfo := v.(*interfaceTypeInfo)
+				if I := types.Unalias(I).(*types.Interface); implements(cinfo, iinfo) {
+					iinfo.implementations.Set(C, struct{}{})
+					// This is okay because consumers are expected to not use cinfo.implements until cinfo.initDone is closed
+					cinfo.implements.SetNoLock(I, struct{}{})
+				}
+			})
+
+			close(cinfo.initDone)
+		} else {
+			return oldcinfo.(*concreteTypeInfo)
+		}
 	}
 	return cinfo
 }
 
 // implementations(I) returns all currently known concrete types that implement I.
 func (r *rta) implementations(I *types.Interface) *interfaceTypeInfo {
-	iinfo, ok := r.interfaceTypeInfoTbl[I]
-	if !ok {
-		panic(fmt.Sprintf("Interface not found in table! %v", I))
-	}
-	for !iinfo.initialized {
-		iinfo.mu.Lock()
-		for C, cinfo := range r.concreteTypeInfoTbl {
-			if implements(cinfo, iinfo) {
-				iinfo.implementations = append(iinfo.implementations, C)
-			}
+	// Create an info for I the first time we see it.
+	var iinfo *interfaceTypeInfo
+	if v := r.interfaceTypes.At(I); v != nil {
+		iinfo = v.(*interfaceTypeInfo)
+	} else {
+		mset := r.prog.MethodSets.MethodSet(I)
+		iinfo = &interfaceTypeInfo{
+			I:        I,
+			mset:     mset,
+			fprint:   fingerprint(mset),
+			initDone: make(chan struct{}),
 		}
-		iinfo.initialized = true
-		iinfo.mu.Unlock()
+		if oldiinfo, loaded := r.interfaceTypes.LoadOrStore(I, iinfo); !loaded {
+			// Ascertain set of concrete types that implement I
+			// and update the 'implements' relation.
+
+			r.concreteTypes.Iterate(func(C types.Type, v any) {
+				cinfo := v.(*concreteTypeInfo)
+				if implements(cinfo, iinfo) {
+					cinfo.implements.Set(I, struct{}{})
+					// This is okay because consumers are expected to not use iinfo.implementations until iinfo.initDone is closed
+					iinfo.implementations.SetNoLock(C, struct{}{})
+				}
+			})
+
+			close(iinfo.initDone)
+		} else {
+			return oldiinfo.(*interfaceTypeInfo)
+		}
 	}
 	return iinfo
-}
-
-func (r *rta) lockedUnalias(T types.Type) types.Type {
-	// r.aliasLk.Lock()
-	OT := types.Unalias(T)
-	// r.aliasLk.Unlock()
-	return OT
 }
 
 // addRuntimeType is called for each concrete type that can be the
@@ -492,12 +615,13 @@ func (r *rta) lockedUnalias(T types.Type) types.Type {
 func (r *rta) addRuntimeType(T types.Type, skip bool) {
 	// Never record aliases.
 
-	T = r.lockedUnalias(T)
+	T = types.Unalias(T)
 
-	if prev, loaded := r.result.RuntimeTypes.LoadOrStore(T, skip); loaded {
+	if prev, loaded := r.result.runtimeTypes.LoadOrStore(T, skip); loaded {
 		// Type already exists, update if we need to change skip from true to false
+		// `skip` only moves from true to false, not the other way around.
 		if !skip && prev.(bool) {
-			r.result.RuntimeTypes.Set(T, skip)
+			r.result.runtimeTypes.Set(T, skip)
 		}
 		return
 	}
@@ -520,15 +644,20 @@ func (r *rta) addRuntimeType(T types.Type, skip bool) {
 		// Add callgraph edge for each existing dynamic
 		// "invoke"-mode call via that interface.
 		cinfo := r.interfaces(T)
-		for _, I := range cinfo.implements {
+
+		// Wait for initialization to complete
+		<-cinfo.initDone
+
+		cinfo.implements.Iterate(func(k types.Type, v any) {
+			I := k.(*types.Interface)
 			val, _ := r.invokeSites.LoadOrStore(I, &callSites{})
 			s := val.(*callSites)
-			s.lk.Lock()
-			for _, site := range s.sites {
+			s.sites.Range(func(key any, value any) bool {
+				site := key.(ssa.CallInstruction)
 				r.addInvokeEdge(site, T)
-			}
-			s.lk.Unlock()
-		}
+				return true
+			})
+		})
 	}
 
 	// Precondition: T is not a method signature (*Signature with Recv()!=nil).
@@ -536,11 +665,11 @@ func (r *rta) addRuntimeType(T types.Type, skip bool) {
 	// Each package maintains its own set of types it has visited.
 
 	var n *types.Named
-	switch T := r.lockedUnalias(T).(type) {
+	switch T := types.Unalias(T).(type) {
 	case *types.Named:
 		n = T
 	case *types.Pointer:
-		n, _ = r.lockedUnalias(T.Elem()).(*types.Named)
+		n, _ = types.Unalias(T.Elem()).(*types.Named)
 	}
 	if n != nil {
 		owner := n.Obj().Pkg()
@@ -643,72 +772,71 @@ func implements(cinfo *concreteTypeInfo, iinfo *interfaceTypeInfo) (got bool) {
 	return iinfo.fprint & ^cinfo.fprint == 0 && types.Implements(cinfo.C, iinfo.I)
 }
 
-// NodeHash computes a hash for a callgraph.Node incorporating its function and all edges
-func NodeHash(node *callgraph.Node) uint64 {
-	if node == nil || node.Func == nil {
-		return 0
+// dedupEdges is a helper function to de-duplicate the edges of a node in-place
+func dedupEdges(edges []*callgraph.Edge) []*callgraph.Edge {
+	// For small edge counts, use O(N^2) algorithm to avoid map allocation
+	if len(edges) < _dedupEdgesSmallThreshold {
+		return dedupEdgesSmall(edges)
 	}
-
-	h := fnv.New64a()
-
-	// Hash the function name
-	h.Write([]byte(node.Func.String()))
-
-	// Hash incoming edges (deduplicated)
-	inEdgeSet := make(map[string]bool)
-	for _, edge := range node.In {
-		edgeStr := edgeHash(edge)
-		inEdgeSet[edgeStr] = true
-	}
-	inEdges := make([]string, 0, len(inEdgeSet))
-	for edgeStr := range inEdgeSet {
-		inEdges = append(inEdges, edgeStr)
-	}
-	sort.Strings(inEdges) // Ensure deterministic order
-	for _, edgeStr := range inEdges {
-		h.Write([]byte("IN:"))
-		h.Write([]byte(edgeStr))
-	}
-
-	// Hash outgoing edges (deduplicated)
-	outEdgeSet := make(map[string]bool)
-	for _, edge := range node.Out {
-		edgeStr := edgeHash(edge)
-		outEdgeSet[edgeStr] = true
-	}
-	outEdges := make([]string, 0, len(outEdgeSet))
-	for edgeStr := range outEdgeSet {
-		outEdges = append(outEdges, edgeStr)
-	}
-	sort.Strings(outEdges) // Ensure deterministic order
-	for _, edgeStr := range outEdges {
-		h.Write([]byte("OUT:"))
-		h.Write([]byte(edgeStr))
-	}
-
-	return h.Sum64()
+	return dedupEdgesLarge(edges)
 }
 
-// edgeHash computes a hash string for a callgraph.Edge
-func edgeHash(edge *callgraph.Edge) string {
-	if edge == nil {
-		return ""
+// dedupEdgesLarge deduplicates edges in-place using a map for larger edge counts
+func dedupEdgesLarge(edges []*callgraph.Edge) []*callgraph.Edge {
+	seen := make(map[callgraph.Edge]int)
+	writeIdx := 0
+
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+
+		if idx, ok := seen[*edge]; !ok {
+			// First time seeing this edge, add it
+			seen[*edge] = writeIdx
+			edges[writeIdx] = edge
+			writeIdx++
+		} else {
+			// Already seen, keep the one with smaller pointer value
+			existing := edges[idx]
+			if uintptr(unsafe.Pointer(edge)) < uintptr(unsafe.Pointer(existing)) {
+				edges[idx] = edge
+			}
+		}
 	}
 
-	callerStr := ""
-	if edge.Caller != nil && edge.Caller.Func != nil {
-		callerStr = edge.Caller.Func.String()
+	return edges[:writeIdx]
+
+}
+
+// dedupEdgesSmall deduplicates edges in-place using O(N^2) algorithm for small edge counts
+// to avoid map allocation overhead
+func dedupEdgesSmall(edges []*callgraph.Edge) []*callgraph.Edge {
+	writeIdx := 0
+
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+
+		// Check if this edge is already in the deduplicated portion
+		found := false
+		for i := 0; i < writeIdx; i++ {
+			if *edge == *edges[i] {
+				found = true
+				// Keep the edge with smaller pointer value
+				if uintptr(unsafe.Pointer(edge)) < uintptr(unsafe.Pointer(edges[i])) {
+					edges[i] = edge
+				}
+				break
+			}
+		}
+
+		if !found {
+			edges[writeIdx] = edge
+			writeIdx++
+		}
 	}
 
-	calleeStr := ""
-	if edge.Callee != nil && edge.Callee.Func != nil {
-		calleeStr = edge.Callee.Func.String()
-	}
-
-	siteStr := ""
-	if edge.Site != nil {
-		siteStr = edge.Site.String()
-	}
-
-	return fmt.Sprintf("%s->%s@%s", callerStr, calleeStr, siteStr)
+	return edges[:writeIdx]
 }

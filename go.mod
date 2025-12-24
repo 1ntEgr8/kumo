@@ -1,4 +1,4 @@
-module github.com/1ntEgr8/prta
+module github.com/1ntEgr8/kumo
 
 go 1.24.3
 
