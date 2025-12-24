@@ -14,7 +14,6 @@ import (
 	"unsafe"
 
 	"github.com/1ntEgr8/kumo"
-	"github.com/1ntEgr8/kumo/lockfree"
 	"github.com/1ntEgr8/kumo/utils"
 	"golang.org/x/tools/go/callgraph"
 	rtapkg "golang.org/x/tools/go/callgraph/rta"
@@ -111,7 +110,7 @@ type rta struct {
 
 	reflectValueCall *ssa.Function // (*reflect.Value).Call, iff part of prog
 
-	work     *lockfree.MSQueue[workItem]
+	work     *utils.MSQueue[workItem]
 	workDone chan struct{}
 	workWg   sync.WaitGroup
 
@@ -395,7 +394,7 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, numWorkers int
 	r := &rta{
 		result: &Result{},
 		prog:     roots[0].Prog,
-		work:     lockfree.NewMSQueue[workItem](),
+		work:     utils.NewMSQueue[workItem](),
 		workDone: make(chan struct{}),
 	}
 

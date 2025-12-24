@@ -1,4 +1,4 @@
-package lockfree
+package utils
 
 import (
 	"runtime"
