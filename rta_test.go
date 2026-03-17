@@ -1,10 +1,12 @@
 package kumo_test
 
 import (
-	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +88,16 @@ func countUniqueEdges(cg *callgraph.Graph) int {
 	return len(seen)
 }
 
-var k8sPath = flag.String("k8s-path", "", "Path to kubernetes repository (v1.35.1)")
+// getNumWorkers returns the number of workers to use for parallel implementations.
+// It reads from NUM_WORKERS env var, defaulting to runtime.NumCPU().
+func getNumWorkers() int {
+	if s := os.Getenv("NUM_WORKERS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	return runtime.NumCPU()
+}
 
 func TestImplementations(t *testing.T) {
 	// Initialize all implementations to verify they compile and can be instantiated
@@ -104,39 +115,116 @@ func TestImplementations(t *testing.T) {
 	// TODO: Add actual test logic
 }
 
-// TestRTAVariantsKubelet runs all RTA variants (parallel and sequential) on the
-// Kubernetes kubelet main function and times each variant.
-//
-// To run this test, you need a compatible kubernetes version available:
-//
-//	git clone --depth 1 --branch v1.32.0 https://github.com/kubernetes/kubernetes.git /path/to/kubernetes
-//
-// Run with:
-//
-//	go test -v -run TestRTAVariantsKubelet -timeout 30m -k8s-path=/path/to/kubernetes
-//
-// Or set the K8S_PATH environment variable:
-//
-//	K8S_PATH=/path/to/kubernetes go test -v -run TestRTAVariantsKubelet -timeout 30m
-func TestRTAVariantsKubelet(t *testing.T) {
-	// Get kubernetes repo path from flag or environment variable
-	repoPath := *k8sPath
-	if repoPath == "" {
-		repoPath = os.Getenv("K8S_PATH")
+// benchmarkTarget describes an OSS project to benchmark
+type benchmarkTarget struct {
+	Name    string // Display name (used for -benchmark flag)
+	DirName string // Directory name in datasets folder
+	PkgPath string // Package path relative to repo root
+}
+
+// ossBenchmarkTargets defines the OSS projects available for benchmarking
+var ossBenchmarkTargets = []benchmarkTarget{
+	{"kubernetes-kubelet", "kubernetes", "./cmd/kubelet"},
+	{"kubernetes-apiserver", "kubernetes", "./cmd/kube-apiserver"},
+	{"prometheus", "prometheus", "./cmd/prometheus"},
+	{"etcd", "etcd", "./server"},
+	{"terraform", "terraform", "."},
+	{"hugo", "hugo", "."},
+	{"consul", "consul", "."},
+	{"vault", "vault", "."},
+	{"grafana", "grafana", "./pkg/cmd/grafana"},
+	{"traefik", "traefik", "./cmd/traefik"},
+	{"minio", "minio", "./cmd/minio"},
+	{"gitea", "gitea", "."},
+	{"containerd", "containerd", "./cmd/containerd"},
+	{"nats-server", "nats-server", "."},
+	{"caddy", "caddy", "./cmd/caddy"},
+	{"syncthing", "syncthing", "./cmd/syncthing"},
+}
+
+// findTarget looks up a benchmark target by name
+func findTarget(name string) *benchmarkTarget {
+	for i := range ossBenchmarkTargets {
+		if ossBenchmarkTargets[i].Name == name {
+			return &ossBenchmarkTargets[i]
+		}
 	}
-	if repoPath == "" {
-		t.Skip("Skipping: kubernetes repo path not provided. Use -k8s-path flag or K8S_PATH env var")
+	return nil
+}
+
+// listTargets returns a comma-separated list of available target names
+func listTargets() string {
+	names := make([]string, len(ossBenchmarkTargets))
+	for i, t := range ossBenchmarkTargets {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+// rtaVariant describes an RTA implementation variant
+type rtaVariant struct {
+	name string
+	impl kumo.RTA
+}
+
+// rtaResult holds the benchmark results for one variant
+type rtaResult struct {
+	name            string
+	duration        time.Duration
+	reachableCount  int
+	nodeCount       int
+	edgeCount       int
+	uniqueEdgeCount int
+	depth           int
+}
+
+// allRTAVariants contains all available RTA implementations
+var allRTAVariants = map[string]func() kumo.RTA{
+	"prta_naive":            func() kumo.RTA { return prta_naive.New() },
+	"prta_kumo":             func() kumo.RTA { return prta_kumo.New() },
+	"prta_nonblocking":      func() kumo.RTA { return prta_nonblocking.New() },
+	"prta_kumo_nonblocking": func() kumo.RTA { return prta_kumo_nonblocking.New() },
+	"srta":                  func() kumo.RTA { return srta.New() },
+	"srta_kumo":             func() kumo.RTA { return srta_kumo.New() },
+}
+
+// defaultVariantOrder defines the default order of variants
+var defaultVariantOrder = []string{
+	"prta_naive", "prta_kumo", "prta_nonblocking", "prta_kumo_nonblocking", "srta", "srta_kumo",
+}
+
+// getRTAVariants returns RTA variants based on VARIANTS env var
+// VARIANTS can be comma-separated list like "prta_naive,srta" or "all" (default)
+func getRTAVariants() []rtaVariant {
+	variantFilter := os.Getenv("VARIANTS")
+	if variantFilter == "" || variantFilter == "all" {
+		// Return all in default order
+		variants := make([]rtaVariant, 0, len(defaultVariantOrder))
+		for _, name := range defaultVariantOrder {
+			variants = append(variants, rtaVariant{name, allRTAVariants[name]()})
+		}
+		return variants
 	}
 
-	// Verify the path exists
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		t.Fatalf("Kubernetes repo path does not exist: %s", repoPath)
+	// Parse comma-separated list
+	requested := strings.Split(variantFilter, ",")
+	variants := make([]rtaVariant, 0, len(requested))
+	for _, name := range requested {
+		name = strings.TrimSpace(name)
+		if factory, ok := allRTAVariants[name]; ok {
+			variants = append(variants, rtaVariant{name, factory()})
+		}
 	}
+	return variants
+}
 
-	// Load the kubelet package from the local kubernetes repo
-	// This corresponds to: https://github.com/kubernetes/kubernetes/blob/v1.35.1/cmd/kubelet/kubelet.go
-	kubeletPkg := "./cmd/kubelet"
+// listVariants returns a comma-separated list of available variant names
+func listVariants() string {
+	return strings.Join(defaultVariantOrder, ", ")
+}
 
+// loadSSAProgram loads and builds an SSA program from the given directory and package path
+func loadSSAProgram(t *testing.T, repoPath, pkgPath string) (*ssa.Program, *ssa.Function, []*ssa.Function) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -150,9 +238,9 @@ func TestRTAVariantsKubelet(t *testing.T) {
 		Dir: repoPath,
 	}
 
-	t.Logf("Loading package %s from %s...", kubeletPkg, repoPath)
+	t.Logf("Loading package %s from %s...", pkgPath, repoPath)
 	loadStart := time.Now()
-	pkgs, err := packages.Load(cfg, kubeletPkg)
+	pkgs, err := packages.Load(cfg, pkgPath)
 	if err != nil {
 		t.Fatalf("Failed to load package: %v", err)
 	}
@@ -172,7 +260,7 @@ func TestRTAVariantsKubelet(t *testing.T) {
 	// Find the main function
 	var mainFn *ssa.Function
 	for _, pkg := range prog.AllPackages() {
-		if pkg.Pkg.Name() == "main" {
+		if pkg != nil && pkg.Pkg.Name() == "main" {
 			if fn := pkg.Func("main"); fn != nil {
 				mainFn = fn
 				break
@@ -189,46 +277,22 @@ func TestRTAVariantsKubelet(t *testing.T) {
 	// Collect all init functions as roots
 	roots := []*ssa.Function{mainFn}
 	for _, pkg := range prog.AllPackages() {
-		if initFn := pkg.Func("init"); initFn != nil {
-			roots = append(roots, initFn)
+		if pkg != nil {
+			if initFn := pkg.Func("init"); initFn != nil {
+				roots = append(roots, initFn)
+			}
 		}
 	}
 	t.Logf("Total roots (main + init functions): %d", len(roots))
 
-	// Number of workers for parallel implementations
-	numWorkers := runtime.NumCPU()
-	t.Logf("Using %d workers for parallel implementations", numWorkers)
+	return prog, mainFn, roots
+}
 
-	// Define all RTA variants to test (parallel and sequential)
-	type rtaVariant struct {
-		name string
-		impl kumo.RTA
-	}
+// runRTABenchmark runs RTA variants on the given roots and returns results
+func runRTABenchmark(t *testing.T, roots []*ssa.Function, numWorkers int) []rtaResult {
+	variants := getRTAVariants()
+	var results []rtaResult
 
-	variants := []rtaVariant{
-		// Parallel implementations
-		{"prta_naive", prta_naive.New()},
-		{"prta_kumo", prta_kumo.New()},
-		{"prta_nonblocking", prta_nonblocking.New()},
-		{"prta_kumo_nonblocking", prta_kumo_nonblocking.New()},
-		// Sequential implementations
-		{"srta", srta.New()},
-		{"srta_kumo", srta_kumo.New()},
-	}
-
-	// Results summary
-	type result struct {
-		name            string
-		duration        time.Duration
-		reachableCount  int
-		nodeCount       int
-		edgeCount       int
-		uniqueEdgeCount int
-		span            int
-	}
-	var results []result
-
-	// Run each variant
 	for _, v := range variants {
 		t.Run(v.name, func(t *testing.T) {
 			t.Logf("Running %s...", v.name)
@@ -247,41 +311,120 @@ func TestRTAVariantsKubelet(t *testing.T) {
 			reachable := res.GetReachable()
 			cg := res.GetCallGraph()
 
-			var nodeCount, edgeCount, uniqueEdgeCount, span int
+			var nodeCount, edgeCount, uniqueEdgeCount, depth int
 			if cg != nil {
 				nodeCount = len(cg.Nodes)
 				for _, node := range cg.Nodes {
 					edgeCount += len(node.Out)
 				}
 				uniqueEdgeCount = countUniqueEdges(cg)
-				span, _ = callgraphMaxDepth(cg)
+				depth, _ = callgraphMaxDepth(cg)
 			}
 
 			t.Logf("%s completed in %v", v.name, duration)
 			t.Logf("  Reachable functions: %d", len(reachable))
-			t.Logf("  Call graph nodes: %d, edges: %d (unique: %d), max depth: %d", nodeCount, edgeCount, uniqueEdgeCount, span)
+			t.Logf("  Call graph nodes: %d, edges: %d (unique: %d), max depth: %d", nodeCount, edgeCount, uniqueEdgeCount, depth)
 
-			results = append(results, result{
+			results = append(results, rtaResult{
 				name:            v.name,
 				duration:        duration,
 				reachableCount:  len(reachable),
 				nodeCount:       nodeCount,
 				edgeCount:       edgeCount,
 				uniqueEdgeCount: uniqueEdgeCount,
-				span:            span,
+				depth:           depth,
 			})
 		})
 	}
 
-	// Print summary
-	t.Log("\n=== SUMMARY ===")
+	return results
+}
+
+// printBenchmarkSummary prints a summary table of benchmark results
+func printBenchmarkSummary(t *testing.T, targetName string, results []rtaResult) {
+	t.Logf("\n=== SUMMARY: %s ===", targetName)
 	fmt.Printf("\n%-25s %15s %15s %15s %15s %15s %10s %12s\n", "Variant", "Duration", "Reachable", "CG Nodes", "CG Edges", "Unique Edges", "Depth", "Nodes/Depth")
 	fmt.Printf("%s\n", "------------------------------------------------------------------------------------------------------------------------------------------")
 	for _, r := range results {
 		var ratio float64
-		if r.span > 0 {
-			ratio = float64(r.nodeCount) / float64(r.span)
+		if r.depth > 0 {
+			ratio = float64(r.nodeCount) / float64(r.depth)
 		}
-		fmt.Printf("%-25s %15v %15d %15d %15d %15d %10d %12.2f\n", r.name, r.duration, r.reachableCount, r.nodeCount, r.edgeCount, r.uniqueEdgeCount, r.span, ratio)
+		fmt.Printf("%-25s %15v %15d %15d %15d %15d %10d %12.2f\n", r.name, r.duration, r.reachableCount, r.nodeCount, r.edgeCount, r.uniqueEdgeCount, r.depth, ratio)
 	}
+}
+
+// TestRTABenchmark runs RTA benchmarks on OSS projects.
+//
+// Environment variables:
+//
+//	BENCHMARK      - Required. Target name (e.g., "etcd", "consul", "kubernetes-kubelet")
+//	DATASETS_ROOT  - Optional. Path to datasets directory (default: "./datasets")
+//	NUM_WORKERS    - Optional. Number of parallel workers (default: runtime.NumCPU())
+//	VARIANTS       - Optional. Comma-separated list of variants to run (default: "all")
+//	               Available: prta_naive, prta_kumo, prta_nonblocking, prta_kumo_nonblocking, srta, srta_kumo
+//
+// Setup:
+//
+//	./scripts/clone_datasets.sh ./datasets
+//
+// Examples:
+//
+//	# Run etcd benchmark with all variants
+//	BENCHMARK=etcd go test -v -run TestRTABenchmark -timeout 30m
+//
+//	# Run consul with specific variants and 4 workers
+//	BENCHMARK=consul VARIANTS=prta_kumo,srta NUM_WORKERS=4 go test -v -run TestRTABenchmark -timeout 30m
+//
+//	# Run kubernetes-kubelet with custom datasets path
+//	BENCHMARK=kubernetes-kubelet DATASETS_ROOT=/path/to/datasets go test -v -run TestRTABenchmark -timeout 30m
+//
+// Available targets:
+//
+//	kubernetes-kubelet, kubernetes-apiserver, prometheus, etcd, terraform, hugo,
+//	consul, vault, grafana, traefik, minio, gitea, containerd, nats-server, caddy, syncthing
+func TestRTABenchmark(t *testing.T) {
+	// Get configuration from environment
+	benchmarkName := os.Getenv("BENCHMARK")
+	if benchmarkName == "" {
+		t.Skipf("BENCHMARK not set. Available targets: %s", listTargets())
+	}
+
+	datasetsRoot := os.Getenv("DATASETS_ROOT")
+	if datasetsRoot == "" {
+		datasetsRoot = "./datasets"
+	}
+
+	// Find the target
+	target := findTarget(benchmarkName)
+	if target == nil {
+		t.Fatalf("Unknown benchmark target: %s\nAvailable targets: %s", benchmarkName, listTargets())
+	}
+
+	// Build the repo path
+	repoPath := filepath.Join(datasetsRoot, target.DirName)
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+		t.Fatalf("Dataset not found: %s\nRun: ./scripts/clone_datasets.sh %s", repoPath, datasetsRoot)
+	}
+
+	numWorkers := getNumWorkers()
+	variants := getRTAVariants()
+
+	t.Logf("=== Benchmarking %s ===", target.Name)
+	t.Logf("Dataset path: %s", repoPath)
+	t.Logf("Workers: %d", numWorkers)
+	t.Logf("Variants: %s", variantNames(variants))
+
+	_, _, roots := loadSSAProgram(t, repoPath, target.PkgPath)
+	results := runRTABenchmark(t, roots, numWorkers)
+	printBenchmarkSummary(t, target.Name, results)
+}
+
+// variantNames returns a comma-separated list of variant names
+func variantNames(variants []rtaVariant) string {
+	names := make([]string, len(variants))
+	for i, v := range variants {
+		names[i] = v.name
+	}
+	return strings.Join(names, ", ")
 }
