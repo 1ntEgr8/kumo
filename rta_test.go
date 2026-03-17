@@ -1,6 +1,7 @@
 package kumo_test
 
 import (
+	"encoding/csv"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -127,19 +128,17 @@ var ossBenchmarkTargets = []benchmarkTarget{
 	{"kubernetes-kubelet", "kubernetes", "./cmd/kubelet"},
 	{"kubernetes-apiserver", "kubernetes", "./cmd/kube-apiserver"},
 	{"prometheus", "prometheus", "./cmd/prometheus"},
-	{"etcd", "etcd", "./server"},
+	{"etcd", "etcd/server", "."},
 	{"terraform", "terraform", "."},
 	{"hugo", "hugo", "."},
 	{"consul", "consul", "."},
 	{"vault", "vault", "."},
-	{"grafana", "grafana", "./pkg/cmd/grafana"},
-	{"traefik", "traefik", "./cmd/traefik"},
-	{"minio", "minio", "./cmd/minio"},
+{"traefik", "traefik", "./cmd/traefik"},
+	{"minio", "minio", "."},
 	{"gitea", "gitea", "."},
 	{"containerd", "containerd", "./cmd/containerd"},
 	{"nats-server", "nats-server", "."},
 	{"caddy", "caddy", "./cmd/caddy"},
-	{"syncthing", "syncthing", "./cmd/syncthing"},
 }
 
 // findTarget looks up a benchmark target by name
@@ -363,6 +362,7 @@ func printBenchmarkSummary(t *testing.T, targetName string, results []rtaResult)
 //	NUM_WORKERS    - Optional. Number of parallel workers (default: runtime.NumCPU())
 //	VARIANTS       - Optional. Comma-separated list of variants to run (default: "all")
 //	               Available: prta_naive, prta_kumo, prta_nonblocking, prta_kumo_nonblocking, srta, srta_kumo
+//	CSV_OUTPUT     - Optional. Path to a CSV file to write results to
 //
 // Setup:
 //
@@ -384,40 +384,103 @@ func printBenchmarkSummary(t *testing.T, targetName string, results []rtaResult)
 //	kubernetes-kubelet, kubernetes-apiserver, prometheus, etcd, terraform, hugo,
 //	consul, vault, grafana, traefik, minio, gitea, containerd, nats-server, caddy, syncthing
 func TestRTABenchmark(t *testing.T) {
-	// Get configuration from environment
-	benchmarkName := os.Getenv("BENCHMARK")
-	if benchmarkName == "" {
-		t.Skipf("BENCHMARK not set. Available targets: %s", listTargets())
-	}
-
 	datasetsRoot := os.Getenv("DATASETS_ROOT")
 	if datasetsRoot == "" {
 		datasetsRoot = "./datasets"
 	}
 
-	// Find the target
-	target := findTarget(benchmarkName)
-	if target == nil {
-		t.Fatalf("Unknown benchmark target: %s\nAvailable targets: %s", benchmarkName, listTargets())
-	}
-
-	// Build the repo path
-	repoPath := filepath.Join(datasetsRoot, target.DirName)
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		t.Fatalf("Dataset not found: %s\nRun: ./scripts/clone_datasets.sh %s", repoPath, datasetsRoot)
+	// Determine targets: all (empty), or comma-separated list
+	benchmarkName := os.Getenv("BENCHMARK")
+	var targets []benchmarkTarget
+	if benchmarkName == "" {
+		targets = ossBenchmarkTargets
+	} else {
+		for _, name := range strings.Split(benchmarkName, ",") {
+			name = strings.TrimSpace(name)
+			target := findTarget(name)
+			if target == nil {
+				t.Fatalf("Unknown benchmark target: %s\nAvailable targets: %s", name, listTargets())
+			}
+			targets = append(targets, *target)
+		}
 	}
 
 	numWorkers := getNumWorkers()
-	variants := getRTAVariants()
+	csvPath := os.Getenv("CSV_OUTPUT")
 
-	t.Logf("=== Benchmarking %s ===", target.Name)
-	t.Logf("Dataset path: %s", repoPath)
-	t.Logf("Workers: %d", numWorkers)
-	t.Logf("Variants: %s", variantNames(variants))
+	for _, target := range targets {
+		t.Run(target.Name, func(t *testing.T) {
+			repoPath := filepath.Join(datasetsRoot, target.DirName)
+			if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+				t.Skipf("Dataset not found: %s\nRun: ./scripts/clone_datasets.sh %s", repoPath, datasetsRoot)
+			}
 
-	_, _, roots := loadSSAProgram(t, repoPath, target.PkgPath)
-	results := runRTABenchmark(t, roots, numWorkers)
-	printBenchmarkSummary(t, target.Name, results)
+			variants := getRTAVariants()
+
+			t.Logf("=== Benchmarking %s ===", target.Name)
+			t.Logf("Dataset path: %s", repoPath)
+			t.Logf("Workers: %d", numWorkers)
+			t.Logf("Variants: %s", variantNames(variants))
+
+			_, _, roots := loadSSAProgram(t, repoPath, target.PkgPath)
+			results := runRTABenchmark(t, roots, numWorkers)
+			printBenchmarkSummary(t, target.Name, results)
+
+			if csvPath != "" {
+				writeResultsCSV(t, csvPath, target.Name, numWorkers, results)
+			}
+		})
+	}
+}
+
+// writeResultsCSV writes benchmark results to a CSV file.
+// If the file already exists, it appends rows (no duplicate header).
+// If the file is new, it writes the header first.
+func writeResultsCSV(t *testing.T, path, targetName string, numWorkers int, results []rtaResult) {
+	t.Helper()
+
+	header := []string{"target", "variant", "num_workers", "duration_ms", "reachable", "cg_nodes", "cg_edges", "unique_edges", "depth"}
+
+	// Check if file already exists (to decide whether to write header)
+	writeHeader := true
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		writeHeader = false
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatalf("Failed to open CSV file %s: %v", path, err)
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if writeHeader {
+		if err := w.Write(header); err != nil {
+			t.Fatalf("Failed to write CSV header: %v", err)
+		}
+	}
+
+	workers := strconv.Itoa(numWorkers)
+	for _, r := range results {
+		row := []string{
+			targetName,
+			r.name,
+			workers,
+			fmt.Sprintf("%.2f", float64(r.duration.Milliseconds())),
+			strconv.Itoa(r.reachableCount),
+			strconv.Itoa(r.nodeCount),
+			strconv.Itoa(r.edgeCount),
+			strconv.Itoa(r.uniqueEdgeCount),
+			strconv.Itoa(r.depth),
+		}
+		if err := w.Write(row); err != nil {
+			t.Fatalf("Failed to write CSV row: %v", err)
+		}
+	}
+
+	t.Logf("Results written to %s", path)
 }
 
 // variantNames returns a comma-separated list of variant names

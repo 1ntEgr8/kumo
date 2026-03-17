@@ -42,9 +42,6 @@ clone_if_missing "consul" "https://github.com/hashicorp/consul.git" "v1.19.0"
 # Vault
 clone_if_missing "vault" "https://github.com/hashicorp/vault.git" "v1.17.0"
 
-# Grafana
-clone_if_missing "grafana" "https://github.com/grafana/grafana.git" "v11.1.0"
-
 # Traefik
 clone_if_missing "traefik" "https://github.com/traefik/traefik.git" "v3.1.0"
 
@@ -62,9 +59,6 @@ clone_if_missing "nats-server" "https://github.com/nats-io/nats-server.git" "v2.
 
 # Caddy
 clone_if_missing "caddy" "https://github.com/caddyserver/caddy.git" "v2.8.4"
-
-# Syncthing
-clone_if_missing "syncthing" "https://github.com/syncthing/syncthing.git" "v1.27.10"
 
 popd > /dev/null 2>&1
 
