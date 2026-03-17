@@ -6,7 +6,7 @@
 DATASETS_DIR="${1:-./datasets}"
 
 mkdir -p "$DATASETS_DIR"
-cd "$DATASETS_DIR"
+pushd "$DATASETS_DIR"
 
 clone_if_missing() {
     local name="$1"
@@ -66,6 +66,8 @@ clone_if_missing "caddy" "https://github.com/caddyserver/caddy.git" "v2.8.4"
 # Syncthing
 clone_if_missing "syncthing" "https://github.com/syncthing/syncthing.git" "v1.27.10"
 
+popd > /dev/null 2>&1
+
 echo ""
-echo "Done. Available datasets:"
+echo "Done. Available datasets at $(realpath $DATASETS_DIR):"
 ls -1 "$DATASETS_DIR"
